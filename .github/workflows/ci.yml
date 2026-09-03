@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build -c Release --no-restore
+
+      - name: Verify formatting
+        run: dotnet format --verify-no-changes --no-restore
+
+      # Catches an assembly with no discoverable benchmarks.
+      - name: List benchmarks
+        run: dotnet run -c Release --no-build --project src -- --list flat
+
+      # Runs every benchmark once. Proves they execute; measures nothing, since
+      # hosted runners are far too noisy for timings to mean anything.
+      - name: Smoke run
+        run: dotnet run -c Release --no-build --project src -- --filter '*' --job Dry
