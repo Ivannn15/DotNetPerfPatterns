@@ -1,6 +1,6 @@
 # .NET Performance Patterns
 
-[![CI](https://github.com/Ivannn15/dotnet-perf-patterns/actions/workflows/ci.yml/badge.svg)](https://github.com/Ivannn15/dotnet-perf-patterns/actions/workflows/ci.yml)
+[![CI](https://github.com/Ivannn15/DotNetPerfPatterns/actions/workflows/ci.yml/badge.svg)](https://github.com/Ivannn15/DotNetPerfPatterns/actions/workflows/ci.yml)
 
 BenchmarkDotNet benchmarks for performance patterns I keep hitting in production ASP.NET Core
 services. Each one has the version people normally write next to the alternatives, measured
