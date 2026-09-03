@@ -31,7 +31,7 @@ public class LogMessageAssembly
     private StringLog _stringLog = null!;
     private Reading[] _readings = null!;
 
-    /// <summary>Number of readings described in a single log message.</summary>
+    /// <summary>Number of readings listed in a single log message.</summary>
     [Params(10, 100)]
     public int ReadingCount { get; set; }
 
@@ -57,7 +57,7 @@ public class LogMessageAssembly
         {
             _readings[i] = new Reading(
                 Id: i,
-                Name: $"sensor-{i:D4}",
+                Sensor: $"sensor-{i:D4}",
                 Value: Math.Round(random.NextDouble() * 100, 4),
                 SampleCount: random.Next(1, 1000));
         }
@@ -91,8 +91,8 @@ public class LogMessageAssembly
         var peak = FindPeak(_readings);
 
         _logger.LogInformation(
-            "selected {Name} with value {Value} out of {Count} readings: {Readings}",
-            peak.Name,
+            "peak reading {Sensor} at {Value} out of {Count} readings: {Readings}",
+            peak.Sensor,
             peak.Value,
             _readings.Length,
             Describe(_readings));
@@ -113,8 +113,8 @@ public class LogMessageAssembly
         if (_logger.IsEnabled(LogLevel.Information))
         {
             _logger.LogInformation(
-                "selected {Name} with value {Value} out of {Count} readings: {Readings}",
-                peak.Name,
+                "peak reading {Sensor} at {Value} out of {Count} readings: {Readings}",
+                peak.Sensor,
                 peak.Value,
                 _readings.Length,
                 Describe(_readings));
@@ -140,7 +140,7 @@ public class LogMessageAssembly
         if (_logger.IsEnabled(LogLevel.Information))
         {
             _logger.PeakReading(
-                peak.Name,
+                peak.Sensor,
                 peak.Value,
                 _readings.Length,
                 Describe(_readings));
@@ -165,30 +165,30 @@ public class LogMessageAssembly
 
         _stringLog.Log(
             LogLevel.Information,
-            $"selected {peak.Name} with value {peak.Value} out of {_readings.Length} readings: {Describe(_readings)}");
+            $"peak reading {peak.Sensor} at {peak.Value} out of {_readings.Length} readings: {Describe(_readings)}");
 
         return peak.Id;
     }
 
     private static Reading FindPeak(Reading[] readings)
     {
-        var best = readings[0];
+        var peak = readings[0];
         for (var i = 1; i < readings.Length; i++)
         {
-            if (readings[i].Value > best.Value)
+            if (readings[i].Value > peak.Value)
             {
-                best = readings[i];
+                peak = readings[i];
             }
         }
 
-        return best;
+        return peak;
     }
 
     /// <summary>The expensive argument. Allocates linearly in reading count.</summary>
     private static string Describe(Reading[] readings)
-        => string.Join(", ", readings.Select(c => $"{c.Name}={c.Value}/{c.SampleCount}"));
+        => string.Join(", ", readings.Select(c => $"{c.Sensor}={c.Value}/{c.SampleCount}"));
 
-    private readonly record struct Reading(int Id, string Name, double Value, int SampleCount);
+    private readonly record struct Reading(int Id, string Sensor, double Value, int SampleCount);
 }
 
 internal static partial class ReadingLog
@@ -196,10 +196,10 @@ internal static partial class ReadingLog
     [LoggerMessage(
         EventId = 1,
         Level = LogLevel.Information,
-        Message = "selected {Name} with value {Value} out of {Count} readings: {Readings}")]
+        Message = "peak reading {Sensor} at {Value} out of {Count} readings: {Readings}")]
     public static partial void PeakReading(
         this ILogger logger,
-        string name,
+        string sensor,
         double value,
         int count,
         string readings);
