@@ -1,6 +1,23 @@
-bin/
-obj/
+## Build output
+[Bb]in/
+[Oo]bj/
+artifacts/
+
+## BenchmarkDotNet
 BenchmarkDotNet.Artifacts/
+
+## IDE
 .vs/
 .idea/
+.vscode/
 *.user
+*.rsuser
+*.suo
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Editors
+*.swp
+*~
