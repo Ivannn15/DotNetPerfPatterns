@@ -2,14 +2,16 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0</TargetFramework>
-    <Nullable>enable</Nullable>
-    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>DotNetPerfPatterns</RootNamespace>
+    <AssemblyName>DotNetPerfPatterns.Benchmarks</AssemblyName>
+    <!-- Matches how the services these patterns come from are deployed. Affects Gen0
+         accounting in the reports; Allocated is unaffected. -->
     <ServerGarbageCollection>true</ServerGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.11" />
   </ItemGroup>
 
 </Project>
