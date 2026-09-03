@@ -81,6 +81,11 @@ public class LogMessageAssembly
         "Performance",
         "CA1848:Use the LoggerMessage delegates",
         Justification = "This is the call CA1848 warns about. Measuring what it costs is the point.")]
+    [SuppressMessage(
+        "Performance",
+        "CA1873:Avoid potentially expensive logging",
+        Justification = "CA1873 describes this benchmark exactly: the argument is expensive and " +
+                        "unnecessary when logging is off. The measurement puts a number on it.")]
     public int Eager()
     {
         var peak = FindPeak(_readings);

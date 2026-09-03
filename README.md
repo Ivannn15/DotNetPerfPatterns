@@ -55,6 +55,12 @@ Five call sites, measured with logging off and on:
 The ordinary call costs 236 times the method it is logging about, and allocates 13.5 KB that
 nothing reads. A level check brings it back to within a few percent of doing no logging at all.
 
+This is a known enough problem that the .NET analyzers ship a rule for it. Building this
+repository with `AnalysisLevel` set to latest fails on the `Eager` benchmark with
+[CA1873](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1873):
+"Evaluation of this argument may be expensive and unnecessary if logging is disabled." The
+suppression in the source is there so the benchmark can measure what the rule warns about.
+
 Note that with logging off, `Guarded` and `SourceGenerated` are the same program: `FindPeak`
 plus one `IsEnabled` that returns false. Two rows, one measurement, taken twice.
 
