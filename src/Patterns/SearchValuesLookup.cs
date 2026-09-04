@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Jobs;
@@ -35,10 +34,11 @@ public class SearchValuesLookup
     public void Setup()
     {
         // InlineArray repeats the set as literals, which is what keeps it a compile-time constant.
-        // Nothing else ties the two together, so assert it here.
-        Debug.Assert(
-            DelimiterArray.AsSpan().SequenceEqual([',', ';', ':', '|', '/', '\\', ' ', '\t', '\r', '\n']),
-            "InlineArray has drifted from Delimiters.");
+        // Nothing else ties the two together. Debug.Assert would not help: benchmarks run in Release.
+        if (!DelimiterArray.AsSpan().SequenceEqual([',', ';', ':', '|', '/', '\\', ' ', '\t', '\r', '\n']))
+        {
+            throw new InvalidOperationException("InlineArray has drifted from Delimiters.");
+        }
 
         // Fixed seed, and the only delimiter sits near the end, so the scan covers the whole string.
         var random = new Random(20260904);

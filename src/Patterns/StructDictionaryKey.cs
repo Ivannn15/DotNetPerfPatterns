@@ -69,6 +69,14 @@ public class StructDictionaryKey
             _cheapHashLookups[i] = new CheapHashKey(probe, i);
             _recordLookups[i] = new RecordKey(probe, i);
         }
+
+        // Every arm is measured on hits only, and a miss is much cheaper on the reflection path.
+        // Verify that here rather than claiming it in the README.
+        if (Plain() != EntryCount || Equatable() != EntryCount || Record() != EntryCount
+            || AnalyzerFix() != EntryCount || CheapHash() != EntryCount)
+        {
+            throw new InvalidOperationException("A lookup missed. The arms are no longer comparable.");
+        }
     }
 
     /// <summary>Hand-written IEquatable with HashCode.Combine, which is the usual fix.</summary>
@@ -104,9 +112,9 @@ public class StructDictionaryKey
     }
 
     /// <summary>
-    /// Exactly what CA1815 asks for and nothing more: Equals(object), GetHashCode, and the equality
-    /// operators. The rule never mentions IEquatable&lt;T&gt;, so the comparer is still
-    /// ObjectEqualityComparer and the argument is still boxed.
+    /// What the CA1815 analyzer checks for: an Equals(object) override and the equality operators.
+    /// GetHashCode comes with it because CS0659 requires it. None of that is IEquatable&lt;T&gt;, which
+    /// is what the comparer looks for, so the argument is still boxed on every call.
     /// </summary>
     [Benchmark]
     public int AnalyzerFix()

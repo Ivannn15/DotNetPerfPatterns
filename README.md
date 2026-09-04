@@ -21,6 +21,20 @@ Needs the .NET 10 SDK. One pattern at a time:
 dotnet run -c Release -- --filter '*LogMessageAssembly*'
 ```
 
+The reports under `results/` were produced with more launches than the default, and the header of
+each one records the settings it was run with. Patterns 1 and 2 used three launches:
+
+```bash
+dotnet run -c Release -- --filter '*LogMessageAssembly*' --launchCount 3
+```
+
+Patterns 3 and 4 measure differences of a few nanoseconds and needed more:
+
+```bash
+dotnet run -c Release -- --filter '*StructDictionaryKey*' \
+    --launchCount 9 --warmupCount 10 --iterationCount 20
+```
+
 Reports land in `src/BenchmarkDotNet.Artifacts/results/`. The copies under `results/` are the
 same files, kept in the repository so the numbers quoted below can be checked against a full
 report rather than an excerpt.
@@ -194,198 +208,221 @@ Source: [`src/Patterns/SerializerOptionsReuse.cs`](src/Patterns/SerializerOption
 A struct used as a dictionary key without `IEquatable<T>` resolves to `ObjectEqualityComparer<T>`,
 which calls `object.Equals`. The struct does not override it, so the call lands on `ValueType.Equals`,
 which walks the fields by reflection. `Dictionary` hashes the key first, and that path is
-`ValueType.GetHashCode`, which is reflection too. Both box. Nothing in the source says so.
+`ValueType.GetHashCode`, which reads the fields through the runtime rather than through your code.
+Both of them box. Nothing in the source says so.
 
-Five key types with the same two fields, because three separate things get run together here: what
-the reflection path costs, how much of it the analyzer rule actually removes, and why a
-`record struct` beats an `IEquatable<T>` written by hand.
+Five key types with the same two fields, because three separate things get conflated here: what the
+reflection path costs, how much of it the analyzer rule removes, and why a `record struct` beats an
+`IEquatable<T>` written by hand.
 
 * **Plain** overrides nothing.
-* **AnalyzerFix** does exactly what CA1815 asks and nothing more: `Equals(object)`, `GetHashCode`,
-  and the `==` / `!=` operators.
-* **Equatable** is the real fix, `IEquatable<T>` with `HashCode.Combine`. Baseline.
-* **CheapHash** is the same `IEquatable<T>` with `GetHashCode` replaced by the multiply-and-add a
+* **AnalyzerFix** is what the CA1815 analyzer checks for: an `Equals(object)` override and the
+  `==` / `!=` operators, plus `GetHashCode`, which comes along because CS0659 requires it.
+* **Equatable** is the real fix, `IEquatable<T>` with `HashCode.Combine`.
+* **CheapHash** is that same `IEquatable<T>` with `GetHashCode` replaced by the multiply-and-add a
   record generates.
 * **Record** is a `record struct`, both members generated.
 
+The baseline is `Equatable` rather than `Plain`, so a ratio above 1.00 means slower than the fix
+rather than slower than the bug.
+
 | Method | Entries | Mean | Ratio | Allocated |
 |---|---|---|---|---|
-| Equatable | 100 | 1.93 us | 1.00 | – |
-| **Plain** | 100 | **13.29 us** | **6.92** | **18,400 B** |
-| AnalyzerFix | 100 | 2.87 us | 1.50 | 3,200 B |
-| CheapHash | 100 | 1.36 us | 0.71 | – |
-| Record | 100 | 1.37 us | 0.71 | – |
-| Equatable | 1000 | 20.74 us | 1.00 | – |
-| **Plain** | 1000 | **139.94 us** | **6.75** | **184,000 B** |
-| AnalyzerFix | 1000 | 33.00 us | 1.59 | 32,000 B |
-| CheapHash | 1000 | 14.81 us | 0.71 | – |
-| Record | 1000 | 14.60 us | 0.70 | – |
+| Equatable | 100 | 1.85 us | 1.00 | – |
+| **Plain** | 100 | **14.42 us** | **7.80** | **18,400 B** |
+| AnalyzerFix | 100 | 2.82 us | 1.53 | 3,200 B |
+| CheapHash | 100 | 1.36 us | 0.74 | – |
+| Record | 100 | 1.34 us | 0.73 | – |
+| Equatable | 1000 | 20.60 us | 1.00 | – |
+| **Plain** | 1000 | **131.67 us** | **6.39** | **184,000 B** |
+| AnalyzerFix | 1000 | 32.53 us | 1.58 | 32,000 B |
+| CheapHash | 1000 | 14.78 us | 0.72 | – |
+| Record | 1000 | 14.75 us | 0.72 | – |
 
-Both benchmarks look up every key in the table once, so the numbers divide cleanly: `Plain` costs
-184 B per lookup at either size, `AnalyzerFix` costs 32 B, the rest cost nothing.
+Call it seven times slower rather than 7.80. The `Plain` rows move by a full point of ratio between
+runs, for reasons in the caveats. Everything else here is stable to two decimals.
+
+Both sizes look up every key in the table once, so the allocation divides cleanly: `Plain` costs
+184 B per lookup at either size, `AnalyzerFix` costs 32 B, the other three cost nothing.
 
 ### Where the 184 bytes go
 
-Measured directly with `GC.GetAllocatedBytesForCurrentThread` around single calls:
+Two of these numbers are measured with `GC.GetAllocatedBytesForCurrentThread` around a single call:
+a lone `GetHashCode` on the reflection path costs 32 B, and a lone `Equals` that returns true costs
+152 B. The split of that 152 is not separately measurable from outside, and is worked out from what
+`ValueType.Equals` does and what the objects weigh on a 64-bit runtime:
 
-| | Bytes |
-|---|---|
-| Boxing the key for `ValueType.GetHashCode` | 32 |
-| Two boxes for `ValueType.Equals` | 64 |
-| The `FieldInfo[2]` that `ValueType.Equals` builds to walk the fields | 40 |
-| Two boxed `int` from `FieldInfo.GetValue` on the second field | 48 |
-| **Per lookup that hits** | **184** |
+| | Bytes | |
+|---|---|---|
+| Boxing the key for `ValueType.GetHashCode` | 32 | measured |
+| Two boxes for `ValueType.Equals` | 64 | derived |
+| The `FieldInfo[2]` that `ValueType.Equals` builds to walk the fields | 40 | derived |
+| Two boxed `int` from `FieldInfo.GetValue` on the second field | 48 | derived |
+| **Per lookup that hits** | **184** | measured |
 
 The `string` field costs nothing to read, because `GetValue` hands back the existing reference. The
-`int` is what gets boxed, twice, once per operand.
+`int` is what gets boxed, once per operand.
 
-A lookup that misses costs 32 B, not 184. The hash does not match, so `Equals` is never reached. This
-benchmark is all hits, which is the expensive end of the range.
+A lookup that misses usually costs 32 B rather than 184, because `Dictionary` compares the stored
+32-bit hash before it calls `Equals`, so `Equals` is never reached. Usually, not always: see the
+last section for when two different keys hash the same.
+
+This benchmark is all hits, which is the expensive end of that range, and `GlobalSetup` throws if any
+arm returns a different count rather than leaving that as a claim in the README.
 
 ### What CA1815 asks for is not enough
 
-[CA1815](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1815) says a
-value type "should override Equals" and "should override the equality (==) and inequality (!=)
-operators". It never mentions `IEquatable<T>`. `AnalyzerFix` is that advice followed to the letter,
-and it is still 1.5x slower than the real fix and still allocates 32 B on every lookup.
+[CA1815](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1815) says
+"your value type should implement Equals" and that "you should also provide an implementation of the
+equality and inequality operators". Its example implements `IEquatable<T>` as well, but the analyzer
+does not look for that: it checks for an `object.Equals` override and for the two operators, and it
+is satisfied without `IEquatable<T>`.
 
-The reason is that overriding `Equals(object)` gets rid of one box, not both. The receiver no longer
-needs boxing, because the struct now has its own override. The argument still does, because the
-signature takes `object`. `EqualityComparer<T>.Default` only picks the non-boxing implementation when
-the type implements `IEquatable<T>`, which the rule does not ask for.
+`AnalyzerFix` is the rule satisfied exactly. It is still 1.5x slower than the real fix and still
+allocates 32 B on every lookup.
+
+Overriding `Equals(object)` removes one box, not two. The receiver no longer needs boxing, because
+the struct now has its own override. The argument still does, because the signature takes `object`.
+`EqualityComparer<T>.Default` only picks the non-boxing comparer when the type implements
+`IEquatable<T>`, which is the thing the rule does not check.
 
 Two further things about this rule. It is **not enabled by default**, and by default it only looks at
-externally visible types, so the private key structs in this benchmark would not have tripped it at
-all.
+externally visible types, so the private key structs in this benchmark would not have tripped it.
 
 ### Why the record wins, and it is not the equality
 
 The obvious guess is that the compiler writes a better `Equals`. It does not. `CheapHash` and
-`Record` have different `Equals` implementations and land on the same number, 0.71 in both rows.
-`Equatable` and `CheapHash` have the same `Equals` and differ by 29%.
+`Record` have different `Equals` implementations and land on the same number. `Equatable` and
+`CheapHash` have the identical `Equals` and differ by around 28%.
 
-The whole gap is `GetHashCode`. `HashCode.Combine` runs xxHash32: four rounds plus a final avalanche,
-seeded randomly per process. What a record generates is one multiply and one add per field. For a
-dictionary key that is called on every lookup, and the cheaper hash wins.
+The whole gap is `GetHashCode`. `HashCode.Combine` for two arguments runs two rounds of xxHash32
+plus a final avalanche, seeded randomly per process. What a record generates is one multiply and one
+add per field. For a dictionary key that runs on every lookup, and the cheaper one wins.
 
-Before copying that: the record's hash is **not** randomised per process. Here the string field brings
-its own randomisation through `string.GetHashCode`, but a key made only of integers would hash
-predictably across runs, which matters if untrusted input can choose the keys.
+Two things before copying that hash. It mixes worse than `HashCode.Combine`, which is the trade being
+made and not a free win. And it is not randomized per process: here the string field brings its own
+randomization through `string.GetHashCode`, but a key made only of integers would hash identically
+across runs, which matters when untrusted input chooses the keys.
 
-### What actually triggers the reflection path
+### What actually sends a struct down the reflection path
 
-Not "non-blittable", which is the wording the CA1815 documentation uses. The runtime falls back to
-reflection if **any** of these hold: the struct contains GC references, or it has padding, or it is
-an `[InlineArray]`, or it already overrides `Equals` or `GetHashCode`, or it contains a `float` or a
-`double`. That last one surprises people. `struct { double, double }` has no padding and no
-references and still takes the slow path, because the fast path compares bits and `-0.0` would not
-equal `0.0`.
+Not "non-blittable", which is the wording the CA1815 documentation uses. The runtime falls back if
+**any** of these hold: the struct contains GC references, or it has padding, or it is an
+`[InlineArray]`, or the type already overrides `Equals` or `GetHashCode`, or it contains a `float` or
+a `double`, or it contains another struct that fails the same test.
 
-So `struct { int, int }` shows almost none of this, and `struct { byte, int }` shows all of it. Check
-your own key type before assuming the number transfers.
+The floating-point one surprises people. `struct { double, double }` has no padding and no references
+and still takes the slow path, because the fast path compares raw bits, and by bits `-0.0` does not
+equal `0.0`. NaN payloads are a second reason for the same rule.
 
-One more trap on that path: the reflection `ValueType.GetHashCode` hashes only the **first non-null
-field**. For `PlainKey` that is `Sensor`, and `Channel` never reaches the hash at all. Harmless when
-the first field is unique, quietly catastrophic when it is not.
+So `struct { int, int }` shows almost none of this and `struct { byte, int }` shows all of it. Check
+your own key type rather than assuming the numbers transfer.
+
+One more trap on that path. The reflection `GetHashCode` hashes only the **first non-null field**.
+For `PlainKey` that is `Sensor`, and `Channel` never reaches the hash. Harmless when the first field
+is unique, and quietly expensive when it is not: two keys sharing a `Sensor` collide, which is the
+case where a miss costs the full 184 B instead of 32 B.
 
 ### Caveats
 
-* The three key types could have produced different bucket distributions, which would mean measuring
-  collisions rather than comparison cost. They did not: 1103 buckets for each, 656 to 671 occupied,
-  longest chain 5 to 6, mean chain position within 1.5% across all of them.
+* `Plain` is the noisy row: standard deviation 12 to 15% of its mean, and its ratio moved from 6.68
+  to 7.80 at 100 entries between two runs of the same build. On that path `GetHashCode` asks the
+  runtime which hashing strategy the type needs through an uncached call on every invocation, and the
+  cost of that varies. Errors stay under 5% of the mean, but the ratio should be read as "about
+  seven", not to two decimals. The other eight rows move by less than 2%.
+* The five key types could have produced different bucket distributions, which would mean measuring
+  collisions rather than comparison cost. At 1000 entries they did not: 1103 buckets in every case,
+  656 to 671 of them occupied, longest chain 5 to 6, mean chain position within 1.5% of each other.
 * Lookup keys are built as separate `string` instances with the same content, so the string
   comparison actually runs. Reusing the stored instances would short-circuit it on reference equality
-  and understate every variant.
-* All lookups hit. See the byte table above for what a miss costs.
-* `Plain` is the noisiest row here, with a standard deviation around 11% of its mean at both sizes.
-  The reflection path calls into the runtime through a QCall that is not cached, and it varies.
-* Same machine and settings as the earlier patterns: Apple M1, macOS 15.7.3, .NET 10.0.100, Server
-  GC, five process launches.
+  and understate every arm.
+* `Alloc Ratio` reads `NA` because the baseline allocates nothing.
+* Not run against .NET 9, so this does not show whether anything changed between the two.
+* Apple M1, macOS 15.7.3, .NET 10.0.100, Server GC, nine process launches.
 
 Full report: [`results/StructDictionaryKey.md`](results/StructDictionaryKey.md)
 Source: [`src/Patterns/StructDictionaryKey.cs`](src/Patterns/StructDictionaryKey.cs)
 
-## 4. SearchValues, and a null result that was wrong
+## 4. SearchValues, and a row that would not reproduce
 
 `IndexOfAny` over a set of more than five characters builds an ASCII bitmap on every call.
-`SearchValues<char>` builds it once. Below six values `IndexOfAny` has dedicated paths and there is
-nothing worth caching, which is the same threshold
-[CA1870](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1870) uses:
-the analyzer's own constant is `MinLengthWorthReplacing = 6`.
+`SearchValues<char>` builds it once. Below six values `IndexOfAny` has dedicated paths, and that is
+also where [CA1870](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1870)
+stops firing: the analyzer's own threshold is `MinLengthWorthReplacing = 6`. It does still fire below
+six when the expression allocates, such as `"ab".ToCharArray()`.
 
-Ten delimiters, one of them planted three characters from the end so the scan covers the string.
+Ten delimiters, one of them planted three characters from the end so the scan crosses the string.
 
-| Method | Payload | Mean | Ratio |
-|---|---|---|---|
-| Cached | 128 | 7.49 ns | 1.00 |
-| CachedArray | 128 | 16.70 ns | 2.26 |
-| InlineArray | 128 | 16.30 ns | 2.21 |
-| Cached | 512 | 24.80 ns | 1.00 |
-| CachedArray | 512 | 32.49 ns | 1.31 |
-| InlineArray | 512 | 32.89 ns | 1.33 |
-| Cached | 1024 | 49.73 ns | 1.00 |
-| CachedArray | 1024 | 57.96 ns | 1.17 |
-| InlineArray | 1024 | 58.76 ns | 1.18 |
-| Cached | 4096 | 194.06 ns | 1.00 |
-| CachedArray | 4096 | 215.82 ns | 1.11 |
-| InlineArray | 4096 | 215.64 ns | 1.11 |
+| Method | Payload | Mean | StdDev | Ratio |
+|---|---|---|---|---|
+| Cached | 128 | 7.05 ns | 0.33 | 1.00 |
+| CachedArray | 128 | 15.16 ns | 0.13 | 2.16 |
+| InlineArray | 128 | 15.03 ns | 0.09 | 2.14 |
+| Cached | 512 | 24.35 ns | 0.33 | 1.00 |
+| CachedArray | 512 | 32.39 ns | 0.38 | 1.33 |
+| InlineArray | 512 | 32.33 ns | 0.21 | 1.33 |
+| Cached | 1024 | 50.80 ns | 0.43 | 1.00 |
+| CachedArray | 1024 | 57.96 ns | 0.31 | 1.14 |
+| InlineArray | 1024 | 58.23 ns | 0.85 | 1.15 |
+| Cached | 4096 | 197.21 ns | **10.16** | 1.00 |
+| CachedArray | 4096 | 202.18 ns | 2.31 | 1.03 |
+| InlineArray | 4096 | 201.76 ns | 2.35 | 1.03 |
 
-### The first version of this benchmark reported no difference at all
+### The cost is fixed, and the ratio is not
 
-It had two payload sizes, 128 and 4096, and three process launches. At 4096 it gave 208.2 ns for
-`Cached` against 208.4 ns for `CachedArray`, and the obvious reading was that the setup cost
-amortises away once the scan is long enough.
+Subtract the baseline from the array version at each of the three smaller sizes: 8.11 ns, 8.04 ns,
+7.16 ns. Building the bitmap costs about 8 ns and that does not change as the scan gets longer. What
+changes is what 8 ns is worth: it more than doubles the total at 128 characters, and it is 14% of it
+at 1024.
 
-That reading was wrong, and the report said so if you read past the mean. The `Cached` row at 4096
-had a standard deviation of 13 ns against 4.5 ns for the two rows next to it, and a mean 3 ns above
-its own median. It was one bad row, sitting in the denominator of every ratio on that line.
+So the rule of thumb is worth following wherever a scan is short and runs constantly, which covers
+most parsing of headers, tokens and delimited fields. The variable is the length of a single scan.
+This benchmark does one scan per call, so it does not separate scan length from input length. A
+parser that walks a 4 KB buffer in a hundred short hops pays the 8 ns a hundred times.
 
-Two more sizes and five launches instead of three, and the gap is there at every size.
+### The 4096 row is not a measurement
 
-### What the four sizes show
+The first version of this benchmark used two payload sizes and three launches, and its 4096 row
+reported the array version as the same speed as `SearchValues`. That looked like the setup cost
+amortizing away, and it was worth writing up.
 
-Fitting a line through them separates two effects that the two-point version could not tell apart:
+It was not real. Run it again and that row says something different every time: the gap there came
+out at 0.1 ns, then 34.8 ns, then 5.0 ns across three runs of the same build, while the three shorter
+scans stayed within a nanosecond of 8 in every run. In the published report the baseline at 4096 has a
+standard deviation of 10.2 ns against 2.3 for the two rows beside it, which is larger than the effect
+it is supposed to resolve.
 
-| | Fixed cost | Per character |
-|---|---|---|
-| Cached | 1.3 ns | 0.0471 ns |
-| CachedArray | 7.9 ns | 0.0507 ns |
-| InlineArray | 8.1 ns | 0.0506 ns |
+The per-run numbers are in
+[`results/SearchValuesLookup-repeats.md`](results/SearchValuesLookup-repeats.md). The row stays in
+the table because deleting inconvenient rows is worse, but nothing here is inferred from it.
 
-The bitmap costs about 6.6 ns to build, and it is a **fixed** cost. It does not shrink as the scan
-grows. What shrinks is its share: 123% of the total at 128 characters, 11% at 4096.
-
-The second column is the part worth noticing. The array path is also 7% slower per character, and
-both array variants agree on it to three decimals while differing from `Cached`. That is not noise.
-Caching the values is not only saving the setup, it is also getting a scan loop chosen for that
-specific set.
-
-So the advice is worth following wherever a scan is short and frequent, which is most parsing of
-headers, tokens and delimited fields. On one long scan of a large buffer it is worth about 11%.
-The variable that matters is the length of a single scan, not the size of the input.
+There is a reason not to expect a difference in the per-character rate, either. Both paths end up in
+the same generic instantiation of the same scanning method, so after the bitmap exists the work is
+identical machine code. Any per-character gap that shows up in a fit across these four points is an
+artifact of the 4096 row, not a property of the code.
 
 ### The array at the call site does not allocate
 
 `InlineArray` and `CachedArray` are the same speed, and the memory diagnoser shows nothing for
-either. A constant list of characters passed to a `ReadOnlySpan<char>` parameter compiles to a
+either. A list of constant characters whose target type is `ReadOnlySpan<char>` compiles to a
 `RuntimeHelpers.CreateSpan` against a metadata blob, with no `newarr` in the IL. Hoisting it into a
 `static readonly` field, which a lot of performance writing still recommends, buys nothing.
 
-Two conditions on that. It has been true since Visual Studio 17.5, and it depends on the parameter
-being a span. Collection expression syntax is not what does it: `new[] { ... }` in the same position
-compiles identically, and `char[] d = [...]` assigned to an array variable still allocates.
+Three conditions on that. It needs a compiler from Visual Studio 17.5 or later and a .NET 7 or later
+target. It depends on the target type being `ReadOnlySpan<T>`, not `Span<T>`. And the collection
+expression syntax is not what does it: `new[] { ... }` in the same position compiles identically,
+while `char[] d = [...]` assigned to an array variable still allocates.
 
 ### Caveats
 
 * `Alloc Ratio` reads `NA` because nothing here allocates.
 * Apple M1, so this is ARM64 NEON. `IndexOfAny` has separate AVX-512 paths, and the ratios on a
   recent x86 server will not be these.
-* The two array rows at 4096 have a standard deviation around 5% of their mean, the widest in the
-  table. The differences being described there are 11%, so the ordering holds, but that row is the
-  one to re-measure first if the numbers matter to you.
+* Besides 4096, the widest row is the baseline at 128, at 4.7% standard deviation, where a whole call
+  is seven nanoseconds. The 2.16 ratio in the first row carries that spread with it.
 * `Cached` reaches the search through a virtual call on `SearchValues<char>` and the array variants
   do not, which counts against the baseline rather than for it.
-* .NET 10.0.100, Server GC, five process launches.
+* .NET 10.0.100, Server GC, nine process launches, twenty iterations.
 
 Full report: [`results/SearchValuesLookup.md`](results/SearchValuesLookup.md)
 Source: [`src/Patterns/SearchValuesLookup.cs`](src/Patterns/SearchValuesLookup.cs)
