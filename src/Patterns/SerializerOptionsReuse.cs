@@ -7,22 +7,15 @@ using BenchmarkDotNet.Jobs;
 namespace DotNetPerfPatterns.Patterns;
 
 /// <summary>
-/// The usual advice is to cache JsonSerializerOptions because each instance builds its own metadata.
-/// Since .NET 8 that is no longer how it works: options are matched by structural equality against a
-/// process-wide table of 64 weakly-referenced caching contexts, so two instances configured the same
-/// way share one set of JsonTypeInfo. A per-call instance costs an allocation and a structural
-/// comparison, not a rebuild.
+/// Since .NET 8, options are matched by structural equality against a process-wide table of 64
+/// weakly-referenced caching contexts, so instances configured the same way share one set of
+/// JsonTypeInfo. Building options per call costs an allocation, not a metadata rebuild.
 ///
-/// The advice still holds, but for a different reason. Converters are compared by reference. A fresh
-/// converter instance makes the options structurally unique, nothing matches, and the metadata is
-/// rebuilt from scratch on every call. In .NET 10 that rebuild also emits IL (dotnet/runtime#122548).
+/// Converters, however, are compared by reference. A fresh converter instance makes the options
+/// structurally unique, so nothing matches and the metadata is rebuilt every call. In .NET 10 that
+/// rebuild also emits IL (dotnet/runtime#122548).
 ///
-/// Five call sites, baseline is the cached instance:
-///   Cached                 one static instance, reused;
-///   PerCall                a new instance per call, no converter;
-///   Copied                 new JsonSerializerOptions(existing), which still finds the shared cache;
-///   PerCallSharedConverter a new instance per call holding a shared converter, still matches;
-///   PerCallNewConverter    a new instance per call with a new converter, matches nothing.
+/// Baseline is the cached instance. The two converter benchmarks differ by one word.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net10_0)]
@@ -66,9 +59,8 @@ public class SerializerOptionsReuse
     public int Cached() => JsonSerializer.Serialize(_readings, CachedOptions).Length;
 
     /// <summary>
-    /// A new instance per call. Costs the allocation and the structural comparison, then lands on the
-    /// same shared metadata as everyone else. Flat overhead, so the multiplier shrinks as the payload
-    /// grows.
+    /// A new instance per call. Lands on the same shared metadata, so the overhead is flat and the
+    /// multiplier shrinks as the payload grows.
     /// </summary>
     [Benchmark]
     [SuppressMessage(
@@ -87,9 +79,8 @@ public class SerializerOptionsReuse
     }
 
     /// <summary>
-    /// Copying an existing instance to tweak a setting. The copy starts without a cache reference but
-    /// resolves to the same shared context on first use, so the extra cost is copying the fields, not
-    /// rebuilding metadata.
+    /// The copy starts without a cache reference but resolves to the same shared context on first use.
+    /// What you pay for is copying the fields.
     /// </summary>
     [Benchmark]
     [SuppressMessage(
@@ -103,10 +94,7 @@ public class SerializerOptionsReuse
         return JsonSerializer.Serialize(_readings, options).Length;
     }
 
-    /// <summary>
-    /// Per-call options holding a converter that is itself shared. Structural equality still matches,
-    /// so this behaves like PerCall despite the custom converter.
-    /// </summary>
+    /// <summary>Per-call options with a shared converter. Still matches the cache.</summary>
     [Benchmark]
     [SuppressMessage(
         "Performance",
@@ -125,9 +113,7 @@ public class SerializerOptionsReuse
     }
 
     /// <summary>
-    /// The same code with a fresh converter. Converters are compared by reference, so these options
-    /// match nothing in the cache table and the metadata is rebuilt every call. One word of difference
-    /// from the benchmark above.
+    /// The same code with a fresh converter. Matches nothing, so the metadata is rebuilt every call.
     /// </summary>
     [Benchmark]
     [SuppressMessage(
