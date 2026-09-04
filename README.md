@@ -305,9 +305,93 @@ the first field is unique, quietly catastrophic when it is not.
 Full report: [`results/StructDictionaryKey.md`](results/StructDictionaryKey.md)
 Source: [`src/Patterns/StructDictionaryKey.cs`](src/Patterns/StructDictionaryKey.cs)
 
+## 4. SearchValues, and a null result that was wrong
+
+`IndexOfAny` over a set of more than five characters builds an ASCII bitmap on every call.
+`SearchValues<char>` builds it once. Below six values `IndexOfAny` has dedicated paths and there is
+nothing worth caching, which is the same threshold
+[CA1870](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1870) uses:
+the analyzer's own constant is `MinLengthWorthReplacing = 6`.
+
+Ten delimiters, one of them planted three characters from the end so the scan covers the string.
+
+| Method | Payload | Mean | Ratio |
+|---|---|---|---|
+| Cached | 128 | 7.49 ns | 1.00 |
+| CachedArray | 128 | 16.70 ns | 2.26 |
+| InlineArray | 128 | 16.30 ns | 2.21 |
+| Cached | 512 | 24.80 ns | 1.00 |
+| CachedArray | 512 | 32.49 ns | 1.31 |
+| InlineArray | 512 | 32.89 ns | 1.33 |
+| Cached | 1024 | 49.73 ns | 1.00 |
+| CachedArray | 1024 | 57.96 ns | 1.17 |
+| InlineArray | 1024 | 58.76 ns | 1.18 |
+| Cached | 4096 | 194.06 ns | 1.00 |
+| CachedArray | 4096 | 215.82 ns | 1.11 |
+| InlineArray | 4096 | 215.64 ns | 1.11 |
+
+### The first version of this benchmark reported no difference at all
+
+It had two payload sizes, 128 and 4096, and three process launches. At 4096 it gave 208.2 ns for
+`Cached` against 208.4 ns for `CachedArray`, and the obvious reading was that the setup cost
+amortises away once the scan is long enough.
+
+That reading was wrong, and the report said so if you read past the mean. The `Cached` row at 4096
+had a standard deviation of 13 ns against 4.5 ns for the two rows next to it, and a mean 3 ns above
+its own median. It was one bad row, sitting in the denominator of every ratio on that line.
+
+Two more sizes and five launches instead of three, and the gap is there at every size.
+
+### What the four sizes show
+
+Fitting a line through them separates two effects that the two-point version could not tell apart:
+
+| | Fixed cost | Per character |
+|---|---|---|
+| Cached | 1.3 ns | 0.0471 ns |
+| CachedArray | 7.9 ns | 0.0507 ns |
+| InlineArray | 8.1 ns | 0.0506 ns |
+
+The bitmap costs about 6.6 ns to build, and it is a **fixed** cost. It does not shrink as the scan
+grows. What shrinks is its share: 123% of the total at 128 characters, 11% at 4096.
+
+The second column is the part worth noticing. The array path is also 7% slower per character, and
+both array variants agree on it to three decimals while differing from `Cached`. That is not noise.
+Caching the values is not only saving the setup, it is also getting a scan loop chosen for that
+specific set.
+
+So the advice is worth following wherever a scan is short and frequent, which is most parsing of
+headers, tokens and delimited fields. On one long scan of a large buffer it is worth about 11%.
+The variable that matters is the length of a single scan, not the size of the input.
+
+### The array at the call site does not allocate
+
+`InlineArray` and `CachedArray` are the same speed, and the memory diagnoser shows nothing for
+either. A constant list of characters passed to a `ReadOnlySpan<char>` parameter compiles to a
+`RuntimeHelpers.CreateSpan` against a metadata blob, with no `newarr` in the IL. Hoisting it into a
+`static readonly` field, which a lot of performance writing still recommends, buys nothing.
+
+Two conditions on that. It has been true since Visual Studio 17.5, and it depends on the parameter
+being a span. Collection expression syntax is not what does it: `new[] { ... }` in the same position
+compiles identically, and `char[] d = [...]` assigned to an array variable still allocates.
+
+### Caveats
+
+* `Alloc Ratio` reads `NA` because nothing here allocates.
+* Apple M1, so this is ARM64 NEON. `IndexOfAny` has separate AVX-512 paths, and the ratios on a
+  recent x86 server will not be these.
+* The two array rows at 4096 have a standard deviation around 5% of their mean, the widest in the
+  table. The differences being described there are 11%, so the ordering holds, but that row is the
+  one to re-measure first if the numbers matter to you.
+* `Cached` reaches the search through a virtual call on `SearchValues<char>` and the array variants
+  do not, which counts against the baseline rather than for it.
+* .NET 10.0.100, Server GC, five process launches.
+
+Full report: [`results/SearchValuesLookup.md`](results/SearchValuesLookup.md)
+Source: [`src/Patterns/SearchValuesLookup.cs`](src/Patterns/SearchValuesLookup.cs)
+
 ## Still to come
 
-* `SearchValues` instead of an array of characters
 * Defensive copies from a non-`readonly` struct passed by `in`
 * Regex: the static-call cache, `IsMatch`, and `[GeneratedRegex]`
 * One dictionary lookup instead of three
