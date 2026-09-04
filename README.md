@@ -61,7 +61,7 @@ repository with `AnalysisLevel` set to latest fails on the `Eager` benchmark wit
 "Evaluation of this argument may be expensive and unnecessary if logging is disabled." The
 suppression in the source is there so the benchmark can measure what the rule warns about.
 
-Note that with logging off, `Guarded` and `SourceGenerated` are the same program: `FindPeak`
+With logging off, `Guarded` and `SourceGenerated` are the same program: `FindPeak`
 plus one `IsEnabled` that returns false. Two rows, one measurement, taken twice.
 
 ### Logging on
@@ -74,7 +74,7 @@ plus one `IsEnabled` that returns false. Two rows, one measurement, taken twice.
 | Handled | 100 | 11,318.4 ns | **17,264 B** |
 
 The first three are within noise of each other: when the message is written, the guard buys
-nothing and costs nothing. `Handled` is slower here in this run and its spread is wide; its time
+nothing and costs nothing. `Handled` is slower here in this run and its spread is wide. Its time
 is not comparable to the rest anyway, since it does not go through `ILogger`. Its allocation
 number is the honest part.
 
@@ -107,7 +107,7 @@ what structured backends do. That configuration is not measured here.
 `Handled` is the only variant that avoids the object array, which is the 104-byte gap in the
 "logging on" table. It is also the one to avoid: this implementation flattens the message into a
 plain string, losing the named placeholders that make logs searchable in Seq, Splunk or
-Application Insights. A handler could preserve them; this one does not.
+Application Insights. A handler could preserve them. This one does not.
 
 ### Caveats
 
@@ -179,7 +179,7 @@ where .NET 10 made the rebuild worse by emitting IL for it.
 ### Caveats
 
 * These are steady-state numbers. The first serialization of a type in a process costs milliseconds
-  while the JIT works through the serializer; BenchmarkDotNet burns that during warmup.
+  while the JIT works through the serializer, and BenchmarkDotNet burns that during warmup.
 * The static `CachedOptions` field in the benchmark keeps the shared context rooted for the whole run.
   Code that only ever builds options per call, with nothing holding a reference, can do worse than
   measured here, because the table holds weak references.
@@ -189,9 +189,124 @@ where .NET 10 made the rebuild worse by emitting IL for it.
 Full report: [`results/SerializerOptionsReuse.md`](results/SerializerOptionsReuse.md)
 Source: [`src/Patterns/SerializerOptionsReuse.cs`](src/Patterns/SerializerOptionsReuse.cs)
 
+## 3. A struct as a dictionary key, and what CA1815 leaves behind
+
+A struct used as a dictionary key without `IEquatable<T>` resolves to `ObjectEqualityComparer<T>`,
+which calls `object.Equals`. The struct does not override it, so the call lands on `ValueType.Equals`,
+which walks the fields by reflection. `Dictionary` hashes the key first, and that path is
+`ValueType.GetHashCode`, which is reflection too. Both box. Nothing in the source says so.
+
+Five key types with the same two fields, because three separate things get run together here: what
+the reflection path costs, how much of it the analyzer rule actually removes, and why a
+`record struct` beats an `IEquatable<T>` written by hand.
+
+* **Plain** overrides nothing.
+* **AnalyzerFix** does exactly what CA1815 asks and nothing more: `Equals(object)`, `GetHashCode`,
+  and the `==` / `!=` operators.
+* **Equatable** is the real fix, `IEquatable<T>` with `HashCode.Combine`. Baseline.
+* **CheapHash** is the same `IEquatable<T>` with `GetHashCode` replaced by the multiply-and-add a
+  record generates.
+* **Record** is a `record struct`, both members generated.
+
+| Method | Entries | Mean | Ratio | Allocated |
+|---|---|---|---|---|
+| Equatable | 100 | 1.93 us | 1.00 | – |
+| **Plain** | 100 | **13.29 us** | **6.92** | **18,400 B** |
+| AnalyzerFix | 100 | 2.87 us | 1.50 | 3,200 B |
+| CheapHash | 100 | 1.36 us | 0.71 | – |
+| Record | 100 | 1.37 us | 0.71 | – |
+| Equatable | 1000 | 20.74 us | 1.00 | – |
+| **Plain** | 1000 | **139.94 us** | **6.75** | **184,000 B** |
+| AnalyzerFix | 1000 | 33.00 us | 1.59 | 32,000 B |
+| CheapHash | 1000 | 14.81 us | 0.71 | – |
+| Record | 1000 | 14.60 us | 0.70 | – |
+
+Both benchmarks look up every key in the table once, so the numbers divide cleanly: `Plain` costs
+184 B per lookup at either size, `AnalyzerFix` costs 32 B, the rest cost nothing.
+
+### Where the 184 bytes go
+
+Measured directly with `GC.GetAllocatedBytesForCurrentThread` around single calls:
+
+| | Bytes |
+|---|---|
+| Boxing the key for `ValueType.GetHashCode` | 32 |
+| Two boxes for `ValueType.Equals` | 64 |
+| The `FieldInfo[2]` that `ValueType.Equals` builds to walk the fields | 40 |
+| Two boxed `int` from `FieldInfo.GetValue` on the second field | 48 |
+| **Per lookup that hits** | **184** |
+
+The `string` field costs nothing to read, because `GetValue` hands back the existing reference. The
+`int` is what gets boxed, twice, once per operand.
+
+A lookup that misses costs 32 B, not 184. The hash does not match, so `Equals` is never reached. This
+benchmark is all hits, which is the expensive end of the range.
+
+### What CA1815 asks for is not enough
+
+[CA1815](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1815) says a
+value type "should override Equals" and "should override the equality (==) and inequality (!=)
+operators". It never mentions `IEquatable<T>`. `AnalyzerFix` is that advice followed to the letter,
+and it is still 1.5x slower than the real fix and still allocates 32 B on every lookup.
+
+The reason is that overriding `Equals(object)` gets rid of one box, not both. The receiver no longer
+needs boxing, because the struct now has its own override. The argument still does, because the
+signature takes `object`. `EqualityComparer<T>.Default` only picks the non-boxing implementation when
+the type implements `IEquatable<T>`, which the rule does not ask for.
+
+Two further things about this rule. It is **not enabled by default**, and by default it only looks at
+externally visible types, so the private key structs in this benchmark would not have tripped it at
+all.
+
+### Why the record wins, and it is not the equality
+
+The obvious guess is that the compiler writes a better `Equals`. It does not. `CheapHash` and
+`Record` have different `Equals` implementations and land on the same number, 0.71 in both rows.
+`Equatable` and `CheapHash` have the same `Equals` and differ by 29%.
+
+The whole gap is `GetHashCode`. `HashCode.Combine` runs xxHash32: four rounds plus a final avalanche,
+seeded randomly per process. What a record generates is one multiply and one add per field. For a
+dictionary key that is called on every lookup, and the cheaper hash wins.
+
+Before copying that: the record's hash is **not** randomised per process. Here the string field brings
+its own randomisation through `string.GetHashCode`, but a key made only of integers would hash
+predictably across runs, which matters if untrusted input can choose the keys.
+
+### What actually triggers the reflection path
+
+Not "non-blittable", which is the wording the CA1815 documentation uses. The runtime falls back to
+reflection if **any** of these hold: the struct contains GC references, or it has padding, or it is
+an `[InlineArray]`, or it already overrides `Equals` or `GetHashCode`, or it contains a `float` or a
+`double`. That last one surprises people. `struct { double, double }` has no padding and no
+references and still takes the slow path, because the fast path compares bits and `-0.0` would not
+equal `0.0`.
+
+So `struct { int, int }` shows almost none of this, and `struct { byte, int }` shows all of it. Check
+your own key type before assuming the number transfers.
+
+One more trap on that path: the reflection `ValueType.GetHashCode` hashes only the **first non-null
+field**. For `PlainKey` that is `Sensor`, and `Channel` never reaches the hash at all. Harmless when
+the first field is unique, quietly catastrophic when it is not.
+
+### Caveats
+
+* The three key types could have produced different bucket distributions, which would mean measuring
+  collisions rather than comparison cost. They did not: 1103 buckets for each, 656 to 671 occupied,
+  longest chain 5 to 6, mean chain position within 1.5% across all of them.
+* Lookup keys are built as separate `string` instances with the same content, so the string
+  comparison actually runs. Reusing the stored instances would short-circuit it on reference equality
+  and understate every variant.
+* All lookups hit. See the byte table above for what a miss costs.
+* `Plain` is the noisiest row here, with a standard deviation around 11% of its mean at both sizes.
+  The reflection path calls into the runtime through a QCall that is not cached, and it varies.
+* Same machine and settings as the earlier patterns: Apple M1, macOS 15.7.3, .NET 10.0.100, Server
+  GC, five process launches.
+
+Full report: [`results/StructDictionaryKey.md`](results/StructDictionaryKey.md)
+Source: [`src/Patterns/StructDictionaryKey.cs`](src/Patterns/StructDictionaryKey.cs)
+
 ## Still to come
 
-* A struct without `IEquatable<T>` used as a dictionary key
 * `SearchValues` instead of an array of characters
 * Defensive copies from a non-`readonly` struct passed by `in`
 * Regex: the static-call cache, `IsMatch`, and `[GeneratedRegex]`
