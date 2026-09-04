@@ -29,7 +29,15 @@ jobs:
       - name: List benchmarks
         run: dotnet run -c Release --no-build --project src -- --list flat
 
-      # Runs every benchmark once. Proves they execute; measures nothing, since
-      # hosted runners are far too noisy for timings to mean anything.
+      # Runs every benchmark once. Proves they execute, and measures nothing: hosted
+      # runners are far too noisy for a timing to mean anything.
+      #
+      # These are job mutators, so they shrink the job the benchmarks already declare.
+      # '--job Dry' would instead add a second job and run the real one as well, which
+      # turns a five second check into a full measurement pass.
       - name: Smoke run
-        run: dotnet run -c Release --no-build --project src -- --filter '*' --job Dry
+        run: >
+          dotnet run -c Release --no-build --project src --
+          --filter '*' --strategy ColdStart
+          --launchCount 1 --warmupCount 1 --iterationCount 1
+          --invocationCount 1 --unrollFactor 1
