@@ -6,9 +6,9 @@ BenchmarkDotNet benchmarks for performance patterns I keep hitting in production
 services. Each one has the version people normally write next to the alternatives, measured
 against a baseline of the same method with the pattern removed.
 
-Two of these contradicted the headline advice outright: one rule holds for a different reason than
-the one usually given, and one holds only until the JIT gets involved. Two more killed a piece of
-folklore attached to them. Those are in here
+Three of the seven contradicted the headline advice outright: one rule holds for a different reason
+than the one usually given, one holds only until the JIT gets involved, and one step could not be
+separated from noise at all. Two more killed a piece of folklore attached to them. Those are in here
 with the numbers that say so, because a benchmark that only ever confirms what you expected is not
 being read carefully enough.
 
@@ -41,7 +41,7 @@ dotnet run -c Release -- --filter '*StructDictionaryKey*' \
     --launchCount 9 --warmupCount 10 --iterationCount 20
 ```
 
-Pattern 5 needed more again:
+Patterns 5 and 7 needed more again:
 
 ```bash
 dotnet run -c Release -- --filter '*DefensiveCopies*' \
@@ -606,9 +606,84 @@ as on the static call, which is why both arms carry a suppression.
 Full report: [`results/RegexConstruction.md`](results/RegexConstruction.md)
 Source: [`src/Patterns/RegexConstruction.cs`](src/Patterns/RegexConstruction.cs)
 
-## Still to come
+## 7. Counting the dictionary probes, and finding the allocation
 
-* One dictionary lookup instead of three
+Counting tokens by key. The first three arms differ only in how many times they hash the key to
+perform one update, and the fourth changes what the key is. The result is not the one the arms were
+built to show.
+
+String hash codes are not memoized in .NET, so three dictionary operations really are three hashes
+of the same string.
+
+* **ContainsKeyThenIndexer** is `ContainsKey`, then the indexer to read, then the indexer to write.
+* **TryGetValueThenIndexer** is the usual fix, two of each.
+* **ValueRef** is `CollectionsMarshal.GetValueRefOrAddDefault`, which hands back a reference into the
+  entry, so reading and writing are one probe.
+* **AlternateLookup** is that same call against a `ReadOnlySpan<char>` alternate lookup, so a string
+  is built only when a token is seen for the first time.
+
+| Method | Mean | StdDev | Ratio | Allocated |
+|---|---|---|---|---|
+| ContainsKeyThenIndexer | 38.44 us | 3.59 | 1.29 | 46.88 KB |
+| TryGetValueThenIndexer | 29.82 us | 1.75 | 1.00 | 46.88 KB |
+| ValueRef | 28.14 us | 2.49 | 0.95 | 46.88 KB |
+| **AlternateLookup** | **16.05 us** | 2.12 | **0.54** | **2.81 KB** |
+
+### Two of the three steps are real
+
+Three probes to two is worth 29%. That step gives a figure for what one probe costs on these keys:
+8.6 us per invocation, or 8.6 ns per token.
+
+Two probes to one should then be worth about the same, and it is not. The measured gap is 1.7 us,
+and two full runs of the same build put `ValueRef` at 0.82 and 0.95 against the same baseline, which
+is a wider disagreement than the effect. The per-run numbers are in
+[`results/DictionaryLookupCount-repeats.md`](results/DictionaryLookupCount-repeats.md).
+
+So the step is somewhere between nothing and what the three-to-two step predicts, and this benchmark
+cannot say where. It is still the right change to make. It is not something these numbers establish.
+
+The fourth arm is where that changes. Around 60 distinct keys appear across 1000 tokens, so 94% of
+updates land on a key the dictionary already holds, and for those no string is needed at all. That is
+16x less allocation and roughly half the time, both far outside the spread.
+
+Which is the useful ordering: the probe count is worth tidying, and the allocation is worth fixing.
+
+### What makes the alternate lookup possible
+
+`GetAlternateLookup<ReadOnlySpan<char>>()` requires the dictionary's comparer to implement
+`IAlternateEqualityComparer<ReadOnlySpan<char>, string>`. The ordinal comparers do, and so do the
+default one and the culture-aware ones. What throws is a hand-written comparer that does not
+implement it, which is the case to watch for.
+
+`StringComparer.Ordinal` also gets the dictionary a non-randomized hashing path, though the default
+comparer gets the same one, so that is a reason to avoid the culture-aware comparers rather than a
+reason to pass anything at all.
+
+The first arm is
+[CA1854](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca1854),
+"Prefer the 'IDictionary.TryGetValue(TKey, out TValue)' method", enabled by default as a suggestion.
+Its stated cause is "an IDictionary element access that's guarded by an IDictionary.ContainsKey
+check", counting two lookups. The arm here does three, since it reads and writes through the indexer,
+so the gap is larger than the rule's own description implies.
+
+### Caveats
+
+* `_counts.Clear()` runs inside every arm and is measured. After the first iteration the capacity is
+  fixed at around 60 entries, so it is tens of nanoseconds against 15 to 37 microseconds of work, and
+  it is identical across arms.
+* Every key is 10 characters with a shared prefix, so each comparison that reaches an entry runs the
+  full length. That is the same for all four arms, but it means these numbers do not transfer to keys
+  that differ in the first character.
+* Under Server GC the `Gen0` column can read low while `Allocated` is accurate. The allocation claim
+  above is from `Allocated`.
+* Standard deviations run from 5.9% to 13.2%, above what the other sections here publish. Fifteen
+  launches did not bring them down, which points at the allocation rather than at run-to-run variance.
+  The 29% and 2x differences survive that comfortably. The 5% one does not, and is reported as
+  unresolved rather than as a result.
+* Apple M1, macOS 15.7.3, .NET 10.0.100, Server GC, fifteen process launches, thirty iterations.
+
+Full report: [`results/DictionaryLookupCount.md`](results/DictionaryLookupCount.md)
+Source: [`src/Patterns/DictionaryLookupCount.cs`](src/Patterns/DictionaryLookupCount.cs)
 
 ## License
 
