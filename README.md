@@ -6,6 +6,11 @@ BenchmarkDotNet benchmarks for performance patterns I keep hitting in production
 services. Each one has the version people normally write next to the alternatives, measured
 against a baseline of the same method with the pattern removed.
 
+Two of these did not come out the way the advice predicts. One rule holds for a different reason
+than the one usually given, and one holds only until the JIT gets involved. Those are in here with
+the numbers that say so, because a benchmark that only ever confirms what you expected is not being
+read carefully enough.
+
 All input is synthetic and generated in `GlobalSetup` with a fixed seed.
 
 ## Running
@@ -33,6 +38,13 @@ Patterns 3 and 4 measure differences of a few nanoseconds and needed more:
 ```bash
 dotnet run -c Release -- --filter '*StructDictionaryKey*' \
     --launchCount 9 --warmupCount 10 --iterationCount 20
+```
+
+Pattern 5 needed more again:
+
+```bash
+dotnet run -c Release -- --filter '*DefensiveCopies*' \
+    --launchCount 15 --warmupCount 15 --iterationCount 30
 ```
 
 Reports land in `src/BenchmarkDotNet.Artifacts/results/`. The copies under `results/` are the
@@ -427,9 +439,98 @@ while `char[] d = [...]` assigned to an array variable still allocates.
 Full report: [`results/SearchValuesLookup.md`](results/SearchValuesLookup.md)
 Source: [`src/Patterns/SearchValuesLookup.cs`](src/Patterns/SearchValuesLookup.cs)
 
+## 5. Defensive copies, and where they stopped happening
+
+Passing a struct by `in` avoids the copy at the call. The standard warning is that it does not avoid
+copies inside: every member the compiler cannot prove leaves the struct alone forces a copy of the
+whole thing first, in case that member writes to it. The advice that follows is to mark the struct
+`readonly`, or at least its members.
+
+The compiler still emits that copy. On .NET 10 it usually does not survive to machine code.
+
+Six arms over the same 56-byte aggregate, seven fields, reached through an `in` parameter. The first
+four read three computed properties small enough for the JIT to inline. The last two call one cheap
+member marked `[MethodImpl(MethodImplOptions.NoInlining)]`, which is what a member too large to
+inline looks like from the caller's side.
+
+| Method | Mean | Ratio |
+|---|---|---|
+| ReadonlyStructIn | 2.125 us | 1.00 |
+| MutableIn | 2.121 us | 1.00 |
+| ReadonlyMembersIn | 2.110 us | 0.99 |
+| MutableByValue | 2.108 us | 0.99 |
+| **ReadonlyStructSeparateMember** | **1.262 us** | **0.59** |
+| **MutableSeparateMember** | **1.967 us** | **0.93** |
+
+The last two arms do less arithmetic than the first four, so their ratios against the baseline say
+nothing. The only comparison those two rows support is with each other.
+
+The first four are the same number. A `readonly struct`, a mutable one, a mutable one with
+`readonly` members, and a plain by-value pass all land within 1% of each other. For members the JIT
+inlines, the advice buys nothing on this runtime.
+
+In the last two, the mutable arm costs 56% more than the `readonly` one, and they differ in exactly
+one thing: whether the struct is `readonly`.
+
+### The copy is always in the IL
+
+Roslyn emits it whenever a non-`readonly` member of a non-`readonly` struct is reached through a
+readonly reference, which an `in` parameter is. It does that regardless of what the JIT will later
+do, and it knows nothing about inlining. So the difference between the two groups above is not the
+compiler changing its mind. It is whether the JIT can delete what the compiler emitted.
+
+### Why the first four are identical
+
+Physical promotion, which arrived in .NET 8 and is on by default. Its decomposition step replaces a
+struct copy that only feeds reads of individual fields with loads of the fields actually read, and
+drops the copy.
+
+This is checkable rather than a story. Take a method that reads three properties off an
+`in MutableWindow` and disassemble it with `DOTNET_TieredCompilation=0`. The loads come straight off
+the incoming byref and there is no copy. Add `DOTNET_JitEnablePhysicalPromotion=0` and eight vector
+loads and stores appear, which is the three copies the IL asked for.
+
+### Why the last two are not
+
+A call that is not inlined needs a real address, so the copy has to materialize somewhere. Physical
+promotion cannot help: setting `DOTNET_JitEnablePhysicalPromotion=0` changes nothing in the
+disassembly of that loop, because the copy is not there to be optimized away.
+
+What the loop does for the mutable struct is zero a 56-byte stack slot and move the element into it,
+32 bytes then 16 then 8, before passing the address of the slot. For the `readonly struct` it
+computes the element's own address in two `add` instructions and passes that. The difference is the
+0.7 ns per window in the table.
+
+### What to take from it
+
+Marking a struct `readonly` is still worth doing. Two analyzer rules push toward it:
+[IDE0251](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/style-rules/ide0251),
+"Member can be made 'readonly'", which is what fires on the struct in this benchmark, and
+[IDE0250](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/style-rules/ide0250),
+"Struct can be made 'readonly'", which only fires once every field is `readonly` too. Both are
+suggestions, and neither runs on a command-line build without `EnforceCodeStyleInBuild`.
+
+What is not true any more is the reason usually given. The copies show up where a member is too big to inline, not
+everywhere a mutable struct meets an `in` parameter, and on a 56-byte struct the cost of one is
+under a nanosecond.
+
+If a codebase is being changed on the strength of this rule, measure it there first. The four arms
+above are what most of that code will look like.
+
+### Caveats
+
+* The `NoInlining` attribute is doing real work in the last two arms. It stands in for a member big
+  enough that the JIT declines to inline it, which is a normal situation but not the one the first
+  four arms measure. Both cases are in the table for that reason.
+* `Midpoint` is deliberately trivial. Anything heavier and the arithmetic swamps a sub-nanosecond
+  copy, which is what an earlier version of this benchmark did wrong.
+* Apple M1, macOS 15.7.3, .NET 10.0.100, Server GC, fifteen process launches, thirty iterations.
+
+Full report: [`results/DefensiveCopies.md`](results/DefensiveCopies.md)
+Source: [`src/Patterns/DefensiveCopies.cs`](src/Patterns/DefensiveCopies.cs)
+
 ## Still to come
 
-* Defensive copies from a non-`readonly` struct passed by `in`
 * Regex: the static-call cache, `IsMatch`, and `[GeneratedRegex]`
 * One dictionary lookup instead of three
 
