@@ -6,10 +6,11 @@ BenchmarkDotNet benchmarks for performance patterns I keep hitting in production
 services. Each one has the version people normally write next to the alternatives, measured
 against a baseline of the same method with the pattern removed.
 
-Two of these did not come out the way the advice predicts. One rule holds for a different reason
-than the one usually given, and one holds only until the JIT gets involved. Those are in here with
-the numbers that say so, because a benchmark that only ever confirms what you expected is not being
-read carefully enough.
+Two of these contradicted the headline advice outright: one rule holds for a different reason than
+the one usually given, and one holds only until the JIT gets involved. Two more killed a piece of
+folklore attached to them. Those are in here
+with the numbers that say so, because a benchmark that only ever confirms what you expected is not
+being read carefully enough.
 
 All input is synthetic and generated in `GlobalSetup` with a fixed seed.
 
@@ -45,6 +46,13 @@ Pattern 5 needed more again:
 ```bash
 dotnet run -c Release -- --filter '*DefensiveCopies*' \
     --launchCount 15 --warmupCount 15 --iterationCount 30
+```
+
+Pattern 6 has one arm that constructs a `Regex` per call, so it needs fewer:
+
+```bash
+dotnet run -c Release -- --filter '*RegexConstruction*' \
+    --launchCount 5 --warmupCount 6 --iterationCount 15
 ```
 
 Reports land in `src/BenchmarkDotNet.Artifacts/results/`. The copies under `results/` are the
@@ -529,9 +537,77 @@ above are what most of that code will look like.
 Full report: [`results/DefensiveCopies.md`](results/DefensiveCopies.md)
 Source: [`src/Patterns/DefensiveCopies.cs`](src/Patterns/DefensiveCopies.cs)
 
+## 6. Regex: the expensive line is not the one people guard
+
+`^[a-z]{3,8}-\d{4}(?:\.\d{1,3})?$`, matched five ways, 100 strings per invocation with one in five
+deliberately failing. The pattern is anchored, so there is no scanning phase: what is left is the
+difference between construction, cache lookup, and the engine itself.
+
+| Method | Mean | Ratio | Allocated |
+|---|---|---|---|
+| Generated | 2,414 ns | 1.00 | – |
+| **NewPerCall** | **136,604 ns** | **56.59** | **366,080 B** |
+| StaticMethod | 8,426 ns | 3.49 | – |
+| CachedInstance | 8,349 ns | 3.46 | – |
+| CachedCompiled | 2,801 ns | 1.16 | – |
+
+### The two rows that are the same
+
+`StaticMethod` and `CachedInstance` differ by less than 1%, and the cached instance came out
+nominally slower despite doing strictly less work. One looks the pattern up in a process-wide cache
+on every call. The other holds a `static readonly Regex` and skips that entirely.
+The lookup is a volatile read of a one-element cache plus a comparison of a four-field key, with no
+lock on that path, and it costs nothing measurable against the matching itself.
+
+That is worth knowing in both directions. Hoisting `Regex.IsMatch(input, pattern)` into a cached
+field, on its own, buys close to nothing. But it is 3.5x off the pace anyway, and the reason is the
+next section.
+
+### The line that actually costs
+
+`new Regex(pattern)` inside the loop is 56x the baseline and allocates 366 KB per invocation. The
+constructor parses the pattern every time and never consults the cache: that is what the static
+method is for. At one input per invocation construction still dominates, around 50x, though those
+rows have a wide spread. That is the shape most real code has: nothing to amortize the construction
+over.
+
+### Interpreted against compiled
+
+After construction, the interpreter is what costs: 3x against `CachedCompiled` and 3.5x against the
+generated matcher. Both cached arms are one instance, built once, reused. One walks interpreter
+opcodes. The other runs IL emitted at construction.
+
+`[GeneratedRegex]` then beats `RegexOptions.Compiled` by 16%. Less than the 3x above it, and the
+steady-state number is not the main reason to prefer it: the generator emits C# at compile time, so
+there is no reflection emit at startup, it survives trimming, and it works under AOT, where
+`RegexOptions.Compiled` silently falls back to the interpreter.
+
+So the ordering of what to fix: stop constructing in a loop, then move off the interpreter. Whether
+the cached instance is reached through a static call or a field is the part that does not matter.
+
+This is [SYSLIB1045](https://learn.microsoft.com/dotnet/fundamentals/syslib-diagnostics/syslib1040-1049),
+"Use 'GeneratedRegexAttribute' to generate the regular expression implementation at compile-time",
+which is enabled by default at Info severity. It fires on the constant-pattern construction as well
+as on the static call, which is why both arms carry a suppression.
+
+### Caveats
+
+* This measures the best case for the static cache lookup. `Pattern` is a `const`, so the cache key
+  holds the same interned reference and the string comparison exits on reference equality. A pattern
+  built at runtime is compared character by character. `CultureInfo.CurrentCulture` is read on every
+  call either way.
+* The single-input rows have standard deviations of 5 to 17% and are in the report for shape rather
+  than for their values. At one input `CachedCompiled` comes out ahead of `Generated`, and that
+  ordering should not be relied on.
+* `NewPerCall` has an 8.8% standard deviation at 100 inputs. Against a 56x ratio it changes nothing.
+* No `IgnoreCase`, so the culture the arms capture differently has no effect on what they match.
+* Apple M1, macOS 15.7.3, .NET 10.0.100, Server GC, five process launches, fifteen iterations.
+
+Full report: [`results/RegexConstruction.md`](results/RegexConstruction.md)
+Source: [`src/Patterns/RegexConstruction.cs`](src/Patterns/RegexConstruction.cs)
+
 ## Still to come
 
-* Regex: the static-call cache, `IsMatch`, and `[GeneratedRegex]`
 * One dictionary lookup instead of three
 
 ## License
